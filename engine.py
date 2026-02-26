@@ -183,7 +183,7 @@ Rules:
     remaining_batches = [(num, text) for num, text in batches if num not in completed]
 
     # ── Concurrent processing ─────────────────────────────────────────────────
-    lock = Lock()
+   lock = Lock()
 
     def process_batch(args):
         batch_num, numbered = args
@@ -195,12 +195,15 @@ Rules:
             completed[batch_num] = tasks
             if checkpoint_state is not None:
                 checkpoint_state["soc_parse_checkpoint"] = completed.copy()
-            if progress_callback:
-                progress_callback(len(completed), total_batches)
         return batch_num, tasks
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
-        list(executor.map(process_batch, remaining_batches))
+        futures = [executor.submit(process_batch, args) for args in remaining_batches]
+        for future in concurrent.futures.as_completed(futures):
+            future.result()  # re-raises any exception from the thread
+            if progress_callback:
+                # Called on main thread — safe for Streamlit
+                progress_callback(len(completed), total_batches)
 
     # ── Reassemble in original order ──────────────────────────────────────────
     all_results = []
