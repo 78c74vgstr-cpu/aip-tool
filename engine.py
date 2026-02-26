@@ -5,6 +5,9 @@ import pandas as pd
 import json
 from openai import OpenAI
 import io
+import time
+import concurrent.futures
+from threading import Lock
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 YELLOW_FILL      = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")  # updated cell
@@ -61,17 +64,70 @@ def _is_description_column(col_name: str) -> bool:
 
 # ── SOC Parser (LLM) ──────────────────────────────────────────────────────────
 
-def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
-                        api_key: str, progress_callback=None) -> list:
+_BATCH_SIZE    = 20    # smaller = faster per call, less likely to time out
+_CALL_TIMEOUT  = 90   # seconds per API call before we give up and retry
+_MAX_RETRIES   = 3    # retry a failed/timed-out batch this many times
+_MAX_WORKERS   = 5    # concurrent API calls (stay under OpenAI rate limits)
+
+
+def _call_llm_with_retry(client, system_prompt: str, numbered: str,
+                          batch_num: int, timeout: int, max_retries: int) -> list:
+    """Call OpenAI with a hard timeout and exponential-backoff retry. Returns list of tasks."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                future = ex.submit(
+                    client.chat.completions.create,
+                    model           = "gpt-4o-mini",
+                    messages        = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user",   "content": f"Process these SOC rows:\n\n{numbered}"},
+                    ],
+                    response_format = {"type": "json_object"},
+                    temperature     = 0,
+                )
+                resp = future.result(timeout=timeout)
+
+            parsed = json.loads(resp.choices[0].message.content)
+            tasks  = parsed.get("tasks", parsed if isinstance(parsed, list) else [])
+            return tasks
+
+        except concurrent.futures.TimeoutError:
+            wait = 2 ** attempt
+            print(f"[LLM] Batch {batch_num} timed out (attempt {attempt}/{max_retries}), retrying in {wait}s…")
+            time.sleep(wait)
+        except Exception as exc:
+            wait = 2 ** attempt
+            print(f"[LLM] Batch {batch_num} error (attempt {attempt}/{max_retries}): {exc}, retrying in {wait}s…")
+            time.sleep(wait)
+
+    print(f"[LLM] Batch {batch_num} permanently failed after {max_retries} attempts — skipping.")
+    return []
+
+
+def parse_soc_with_llm(
+    soc_file_bytes,
+    aip_columns: list,
+    api_key: str,
+    progress_callback=None,
+    checkpoint_state: dict | None = None,   # pass st.session_state dict to enable resume
+) -> list:
     """
-    Parse SOC rows with GPT. Returns list of dicts:
+    Parse SOC rows with GPT concurrently, with per-call timeouts, retries,
+    and optional Streamlit session_state checkpointing so you can resume
+    if the app restarts mid-run.
+
+    checkpoint_state: if provided (e.g. st.session_state), completed batch
+    results are saved under key "soc_parse_checkpoint" and resumed on restart.
+
+    Returns list of dicts per task:
       {
         "task_id": "12345",
-        "changed_columns": ["Interval", "Zone"],          # columns that DO exist in AIP
-        "unmappable_changes": ["Applicability updated"],  # change descriptions that have NO matching AIP column
-        "soc_note": "Full raw SOC text for this task",    # raw SOC text for audit
-        "is_new_task": false,                             # true if SOC says this is a brand-new task
-        "is_deleted_task": false                          # true if SOC says this task is deleted/removed
+        "changed_columns": ["Interval", "Zone"],
+        "unmappable_changes": ["Applicability revised"],
+        "soc_note": "raw SOC text",
+        "is_new_task": false,
+        "is_deleted_task": false
       }
     """
     client = OpenAI(api_key=api_key)
@@ -81,17 +137,11 @@ def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
 
     rows_text = []
     for _, row in soc_df.iterrows():
-        parts = [
-            f"{col}: {val}"
-            for col, val in row.items()
-            if pd.notna(val) and str(val).strip()
-        ]
+        parts = [f"{col}: {val}" for col, val in row.items()
+                 if pd.notna(val) and str(val).strip()]
         rows_text.append(" | ".join(parts))
 
     aip_cols_json = json.dumps(aip_columns)
-    all_results   = []
-    batch_size    = 50
-    total_batches = (len(rows_text) + batch_size - 1) // batch_size
 
     system_prompt = f"""You are an expert in aircraft maintenance documentation.
 
@@ -101,41 +151,65 @@ The AIP uses these EXACT column names (use exact spelling when returning results
 {aip_cols_json}
 
 For each SOC row return a JSON entry with these fields:
-- "task_id"          : Task ID found in "Task", "Task No", "Task Number", or similar field
-- "changed_columns"  : List of AIP column names (exact spelling) that are changed — only columns that EXIST in the AIP list above
-- "unmappable_changes": List of plain-English descriptions of changes that CANNOT be mapped to any AIP column (e.g. "Applicability revised", "New effectivity added")
-- "soc_note"         : The complete raw text of this SOC row, exactly as provided
-- "is_new_task"      : true if the SOC indicates this task is entirely NEW (did not exist before)
-- "is_deleted_task"  : true if the SOC indicates this task is DELETED / REMOVED
+- "task_id"           : Task ID found in "Task", "Task No", "Task Number", or similar field
+- "changed_columns"   : List of AIP column names (exact spelling) that changed — ONLY names from the AIP list above
+- "unmappable_changes": Changes that CANNOT be mapped to any AIP column (e.g. "Applicability revised")
+- "soc_note"          : Complete raw text of this SOC row exactly as provided
+- "is_new_task"       : true if this task is entirely NEW
+- "is_deleted_task"   : true if this task is DELETED / REMOVED
 
 Rules:
-- Return ONLY a JSON object: {{"tasks": [...]}}
-- If Task ID is missing, skip that row.
-- Never invent column names; only use names from the AIP list for changed_columns.
-- Changes that don't map to any AIP column go into unmappable_changes, never into changed_columns.
+- Return ONLY: {{"tasks": [...]}}
+- Skip rows with no Task ID.
+- Never invent column names — only use names from the AIP list for changed_columns.
 """
 
-    for batch_num, i in enumerate(range(0, len(rows_text), batch_size), start=1):
-        batch    = rows_text[i : i + batch_size]
-        numbered = "\n".join(f"{j+1}. {row}" for j, row in enumerate(batch))
-        try:
-            resp = client.chat.completions.create(
-                model           = "gpt-4o-mini",
-                messages        = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": f"Process these SOC rows:\n\n{numbered}"},
-                ],
-                response_format = {"type": "json_object"},
-                temperature     = 0,
-            )
-            parsed = json.loads(resp.choices[0].message.content)
-            tasks  = parsed.get("tasks", parsed if isinstance(parsed, list) else [])
-            all_results.extend(tasks)
-        except Exception as exc:
-            print(f"[LLM] Batch {batch_num} failed: {exc}")
+    # ── Build batches ─────────────────────────────────────────────────────────
+    batches = []
+    for i in range(0, len(rows_text), _BATCH_SIZE):
+        chunk    = rows_text[i : i + _BATCH_SIZE]
+        numbered = "\n".join(f"{j+1}. {r}" for j, r in enumerate(chunk))
+        batches.append((i // _BATCH_SIZE + 1, numbered))   # (batch_num, text)
 
-        if progress_callback:
-            progress_callback(batch_num, total_batches)
+    total_batches = len(batches)
+
+    # ── Resume from checkpoint if available ──────────────────────────────────
+    completed: dict[int, list] = {}   # batch_num → tasks
+    if checkpoint_state is not None:
+        completed = checkpoint_state.get("soc_parse_checkpoint", {})
+        if completed:
+            print(f"[Checkpoint] Resuming — {len(completed)}/{total_batches} batches already done.")
+
+    remaining_batches = [(num, text) for num, text in batches if num not in completed]
+
+    # ── Concurrent processing ─────────────────────────────────────────────────
+    lock = Lock()
+
+    def process_batch(args):
+        batch_num, numbered = args
+        tasks = _call_llm_with_retry(
+            client, system_prompt, numbered,
+            batch_num, _CALL_TIMEOUT, _MAX_RETRIES
+        )
+        with lock:
+            completed[batch_num] = tasks
+            if checkpoint_state is not None:
+                checkpoint_state["soc_parse_checkpoint"] = completed.copy()
+            if progress_callback:
+                progress_callback(len(completed), total_batches)
+        return batch_num, tasks
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        list(executor.map(process_batch, remaining_batches))
+
+    # ── Reassemble in original order ──────────────────────────────────────────
+    all_results = []
+    for batch_num in sorted(completed.keys()):
+        all_results.extend(completed[batch_num])
+
+    # Clear checkpoint on successful completion
+    if checkpoint_state is not None:
+        checkpoint_state.pop("soc_parse_checkpoint", None)
 
     return all_results
 
