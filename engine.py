@@ -183,7 +183,7 @@ Rules:
     remaining_batches = [(num, text) for num, text in batches if num not in completed]
 
     # ── Concurrent processing ─────────────────────────────────────────────────
-   lock = Lock()
+    lock = Lock()
 
     def process_batch(args):
         batch_num, numbered = args
