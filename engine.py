@@ -6,8 +6,6 @@ import json
 from openai import OpenAI
 import io
 import difflib
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ── Styles ────────────────────────────────────────────────────────────────────
 YELLOW_FILL = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
@@ -18,20 +16,33 @@ WHITE_FONT  = Font(color="FFFFFF", bold=True)
 # ── Column Matcher ────────────────────────────────────────────────────────────
 
 def find_best_column_match(aip_col: str, mpd_columns: list) -> str | None:
+    """
+    Try to find the best matching column in MPD for a given AIP column name.
+    Tries in order:
+      1. Exact match
+      2. Case-insensitive match
+      3. One name contains the other (e.g. 'Interval' inside '100% Interval')
+      4. Fuzzy match (similarity > 60%)
+    Returns the best matching MPD column name, or None if no match found.
+    """
     aip_col_clean = aip_col.strip().lower()
 
+    # 1 — Exact match
     if aip_col in mpd_columns:
         return aip_col
 
+    # 2 — Case-insensitive match
     for mpd_col in mpd_columns:
         if mpd_col.strip().lower() == aip_col_clean:
             return mpd_col
 
+    # 3 — Contains match
     for mpd_col in mpd_columns:
         mpd_col_clean = mpd_col.strip().lower()
         if aip_col_clean in mpd_col_clean or mpd_col_clean in aip_col_clean:
             return mpd_col
 
+    # 4 — Fuzzy match
     matches = difflib.get_close_matches(
         aip_col_clean,
         [c.strip().lower() for c in mpd_columns],
@@ -49,6 +60,10 @@ def find_best_column_match(aip_col: str, mpd_columns: list) -> str | None:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def find_header_row(ws, max_search=20):
+    """
+    Find header row = row with most non-empty cells in first max_search rows.
+    Returns (row_number, {column_name: column_index})
+    """
     best_row_num = 1
     best_count   = 0
 
@@ -67,6 +82,9 @@ def find_header_row(ws, max_search=20):
 
 
 def build_task_index(ws, header_row_num, task_col_idx):
+    """
+    Returns {task_id_str: excel_row_number} for all data rows.
+    """
     index = {}
     for col in ws.iter_cols(
         min_col=task_col_idx,
@@ -80,6 +98,9 @@ def build_task_index(ws, header_row_num, task_col_idx):
 
 
 def read_mpd_dataframe(file_bytes):
+    """
+    Read MPD Excel into a DataFrame. Auto-detects header row.
+    """
     raw        = pd.read_excel(file_bytes, header=None, nrows=25)
     header_idx = int(raw.notna().sum(axis=1).idxmax())
 
@@ -89,50 +110,32 @@ def read_mpd_dataframe(file_bytes):
     return df
 
 
-# ── SOC Batch Processor ───────────────────────────────────────────────────────
-
-def process_batch(client, batch_rows, batch_num, aip_cols_json, system_prompt, max_retries=3):
-    """
-    Process a single batch of SOC rows with retry logic.
-    """
-    numbered = "\n".join(f"{j+1}. {row}" for j, row in enumerate(batch_rows))
-
-    for attempt in range(max_retries):
-        try:
-            resp = client.chat.completions.create(
-                model           = "gpt-4o-mini",
-                messages        = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user",   "content": f"Process these SOC rows:\n\n{numbered}"},
-                ],
-                response_format = {"type": "json_object"},
-                temperature     = 0,
-                timeout         = 60,
-            )
-            parsed = json.loads(resp.choices[0].message.content)
-            tasks  = parsed.get("tasks", parsed if isinstance(parsed, list) else [])
-            return batch_num, tasks
-
-        except Exception as exc:
-            wait = 2 ** attempt
-            print(f"[LLM] Batch {batch_num} attempt {attempt+1} failed: {exc}. Retrying in {wait}s...")
-            time.sleep(wait)
-
-    print(f"[LLM] Batch {batch_num} failed after {max_retries} attempts — skipping.")
-    return batch_num, []
-
-
 # ── SOC Parser (LLM) ──────────────────────────────────────────────────────────
 
 def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
                         api_key: str, progress_callback=None) -> list:
+    """
+    Use gpt-4o-mini to read each SOC row and extract:
+      - task_id
+      - changed_columns  (mapped to exact AIP column names)
+      - soc_text         (original change description from the SOC row)
+
+    Returns: [
+        {
+          "task_id": "12345",
+          "changed_columns": ["Interval", "Zone"],
+          "soc_text": "Interval revised per SB-XXX, zone updated"
+        },
+        ...
+    ]
+    """
     client = OpenAI(api_key=api_key)
 
     # Read SOC
     soc_df         = pd.read_excel(soc_file_bytes)
     soc_df.columns = [str(c).strip() for c in soc_df.columns]
 
-    # One text string per row
+    # One text string per row — also store raw text for soc_text
     rows_text = []
     for _, row in soc_df.iterrows():
         parts = [
@@ -143,12 +146,9 @@ def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
         rows_text.append(" | ".join(parts))
 
     aip_cols_json = json.dumps(aip_columns)
-    batch_size    = 150
-    batches       = [
-        rows_text[i : i + batch_size]
-        for i in range(0, len(rows_text), batch_size)
-    ]
-    total_batches = len(batches)
+    all_results   = []
+    batch_size    = 50
+    total_batches = (len(rows_text) + batch_size - 1) // batch_size
 
     system_prompt = f"""You are an expert in aircraft maintenance documentation.
 
@@ -184,35 +184,29 @@ Rules:
 - If a change cannot be mapped to any AIP column, still include the task with an empty changed_columns list but keep the soc_text.
 """
 
-    # ── Parallel processing ───────────────────────────────────────────────────
-    results_map   = {}
-    completed     = 0
+    for batch_num, i in enumerate(range(0, len(rows_text), batch_size), start=1):
+        batch    = rows_text[i : i + batch_size]
+        numbered = "\n".join(f"{j+1}. {row}" for j, row in enumerate(batch))
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {
-            executor.submit(
-                process_batch,
-                client,
-                batch,
-                batch_num,
-                aip_cols_json,
-                system_prompt
-            ): batch_num
-            for batch_num, batch in enumerate(batches, start=1)
-        }
+        try:
+            resp = client.chat.completions.create(
+                model           = "gpt-4o-mini",
+                messages        = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": f"Process these SOC rows:\n\n{numbered}"},
+                ],
+                response_format = {"type": "json_object"},
+                temperature     = 0,
+            )
+            parsed = json.loads(resp.choices[0].message.content)
+            tasks  = parsed.get("tasks", parsed if isinstance(parsed, list) else [])
+            all_results.extend(tasks)
 
-        for future in as_completed(futures):
-            batch_num, tasks = future.result()
-            results_map[batch_num] = tasks
-            completed += 1
+        except Exception as exc:
+            print(f"[LLM] Batch {batch_num} failed: {exc}")
 
-            if progress_callback:
-                progress_callback(completed, total_batches)
-
-    # ── Reassemble in order ───────────────────────────────────────────────────
-    all_results = []
-    for batch_num in sorted(results_map.keys()):
-        all_results.extend(results_map[batch_num])
+        if progress_callback:
+            progress_callback(batch_num, total_batches)
 
     return all_results
 
@@ -221,11 +215,22 @@ Rules:
 
 def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
                task_changes: list, task_id_col_name: str):
+    """
+    Surgically update AIP:
+    - Only the specific cells that changed are touched.
+    - All other formatting (fonts, borders, colors, merged cells) preserved.
+    - Changed cells get a yellow highlight.
+    - A Change Log sheet is added including the original SOC description.
+
+    Returns: (workbook, change_log_list, flagged_list)
+    """
     wb = openpyxl.load_workbook(aip_file_bytes)
     ws = wb.active
 
+    # ── AIP structure ─────────────────────────────────────────────────────────
     header_row_num, aip_headers = find_header_row(ws)
 
+    # Find task ID column with smart matching
     task_id_col_matched = find_best_column_match(task_id_col_name, list(aip_headers.keys()))
     if task_id_col_matched is None:
         raise ValueError(
@@ -236,6 +241,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
     task_col_idx   = aip_headers[task_id_col_matched]
     aip_task_index = build_task_index(ws, header_row_num, task_col_idx)
 
+    # ── MPD task ID column ────────────────────────────────────────────────────
     mpd_task_col = find_best_column_match(task_id_col_name, list(mpd_df.columns))
     if mpd_task_col is None:
         raise ValueError(
@@ -248,6 +254,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
     mpd_lookup           = mpd_df.set_index(mpd_task_col).to_dict(orient="index")
     mpd_columns          = list(mpd_df.columns)
 
+    # ── Apply changes ─────────────────────────────────────────────────────────
     change_log = []
     flagged    = []
 
@@ -279,6 +286,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
         mpd_row_data = mpd_lookup[task_id]
 
         for col_name in changed_columns:
+            # Find AIP column
             aip_col_matched = find_best_column_match(col_name, list(aip_headers.keys()))
             if aip_col_matched is None:
                 flagged.append({
@@ -288,6 +296,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
                 })
                 continue
 
+            # Find MPD column — smart match
             mpd_col_matched = find_best_column_match(col_name, mpd_columns)
             if mpd_col_matched is None:
                 mpd_col_matched = find_best_column_match(aip_col_matched, mpd_columns)
@@ -305,14 +314,17 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
             old_value = cell.value
             new_value = mpd_row_data.get(mpd_col_matched)
 
+            # Normalize NaN → None
             if isinstance(new_value, float) and pd.isna(new_value):
                 new_value = None
 
+            # Skip if value is already the same
             old_str = str(old_value).strip() if old_value is not None else ""
             new_str = str(new_value).strip() if new_value is not None else ""
             if old_str == new_str:
                 continue
 
+            # ── Surgical update: value + fill only ───────────────────────────
             cell.value = new_value
             cell.fill  = YELLOW_FILL
 
@@ -352,6 +364,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
         log_ws.cell(row=r_idx, column=5, value=entry["New Value"])
         log_ws.cell(row=r_idx, column=6, value=entry["SOC Description"])
 
+    # Auto-fit log columns
     for col in log_ws.columns:
         width = max((len(str(cell.value or "")) for cell in col), default=10) + 4
         log_ws.column_dimensions[
