@@ -1,5 +1,5 @@
 import openpyxl
-from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.styles import PatternFill, Font
 from openpyxl.utils import get_column_letter
 import pandas as pd
 import json
@@ -55,28 +55,6 @@ def read_mpd_dataframe(file_bytes):
     return df
 
 
-def ensure_column(ws, header_row_num: int, header_name: str) -> int:
-    last_col = ws.max_column
-    for c in range(1, last_col + 1):
-        v = ws.cell(row=header_row_num, column=c).value
-        if v is not None and str(v).strip().lower() == header_name.strip().lower():
-            return c
-
-    new_col = last_col + 1
-    hcell = ws.cell(row=header_row_num, column=new_col, value=header_name)
-    hcell.fill = BLUE_FILL
-    hcell.font = WHITE_FONT
-    return new_col
-
-
-def safe_set_cell(ws, row: int, col: int, value):
-    for rng in ws.merged_cells.ranges:
-        if rng.min_row <= row <= rng.max_row and rng.min_col <= col <= rng.max_col:
-            row, col = rng.min_row, rng.min_col
-            break
-    ws.cell(row=row, column=col).value = value
-
-
 # ── SOC Parser (LLM) ──────────────────────────────────────────────────────────
 
 def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
@@ -102,41 +80,38 @@ def parse_soc_with_llm(soc_file_bytes, aip_columns: list,
 
     system_prompt = f"""You are an expert in aircraft maintenance documentation.
 
+Your job: analyze rows from a Summary of Changes (SOC) document and extract structured data.
+
 The AIP uses these EXACT column names:
 {aip_cols_json}
 
-Return ONLY:
-{{"tasks":[{{"row_num":1,"task_id":"...","changed_columns":["Col1"]}}]}}
+For each SOC row:
+1. Extract the Task ID.
+2. Identify which AIP columns changed.
+3. Provide a concise "SOC Remark" summarizing the specific change described for audit purposes.
 
 Rules:
-- row_num is position inside the provided batch (1..N)
-- Use exact column names
-- Skip rows with no task_id
+- Return ONLY a JSON object: {{"tasks": [{{"task_id": "...", "changed_columns": ["Col1"], "soc_remark": "..."}}, ...]}}
+- Use EXACT column names from the AIP list.
 """
 
     for batch_num, i in enumerate(range(0, len(rows_text), batch_size), start=1):
         batch    = rows_text[i : i + batch_size]
         numbered = "\n".join(f"{j+1}. {row}" for j, row in enumerate(batch))
-        rownum_to_text = {j+1: row for j, row in enumerate(batch)}
 
         try:
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
+                model           = "gpt-4o-mini",
+                messages        = [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",   "content": f"Process these SOC rows:\n\n{numbered}"},
                 ],
-                response_format={"type": "json_object"},
-                temperature=0,
+                response_format = {"type": "json_object"},
+                temperature     = 0,
             )
-
             parsed = json.loads(resp.choices[0].message.content)
             tasks  = parsed.get("tasks", [])
-
-            for t in tasks:
-                rn = t.get("row_num")
-                t["soc_text"] = rownum_to_text.get(rn, "")
-                all_results.append(t)
+            all_results.extend(tasks)
 
         except Exception as exc:
             print(f"[LLM] Batch {batch_num} failed: {exc}")
@@ -150,26 +125,29 @@ Rules:
 # ── AIP Updater ───────────────────────────────────────────────────────────────
 
 def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
-               task_changes: list, task_id_col_name: str,
-               soc_text_col_name: str = "SOC Text"):
-
+                task_changes: list, task_id_col_name: str):
     wb = openpyxl.load_workbook(aip_file_bytes)
     ws = wb.active
 
     header_row_num, aip_headers = find_header_row(ws)
 
     if task_id_col_name not in aip_headers:
-        raise ValueError(
-            f"Column '{task_id_col_name}' not found in AIP.\n"
-            f"Found columns: {list(aip_headers.keys())}"
-        )
+        raise ValueError(f"Column '{task_id_col_name}' not found in AIP.")
 
-    soc_col_idx = ensure_column(ws, header_row_num, soc_text_col_name)
-    header_row_num, aip_headers = find_header_row(ws)
+    # ── Setup Audit Column at the end ─────────────────────────────────────────
+    audit_col_name = "SOC Remarks"
+    if audit_col_name in aip_headers:
+        audit_col_idx = aip_headers[audit_col_name]
+    else:
+        audit_col_idx = max(aip_headers.values()) + 1
+        header_cell = ws.cell(row=header_row_num, column=audit_col_idx, value=audit_col_name)
+        header_cell.font = Font(bold=True)
+        aip_headers[audit_col_name] = audit_col_idx
 
     task_col_idx   = aip_headers[task_id_col_name]
     aip_task_index = build_task_index(ws, header_row_num, task_col_idx)
 
+    # ── MPD task ID column detection ──────────────────────────────────────────
     mpd_task_col = None
     for col in mpd_df.columns:
         if col.strip().lower() == task_id_col_name.strip().lower():
@@ -180,9 +158,7 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
             if "task" in col.lower():
                 mpd_task_col = col
                 break
-    if mpd_task_col is None:
-        raise ValueError(f"Task ID column not found in MPD.")
-
+    
     mpd_df = mpd_df.copy()
     mpd_df[mpd_task_col] = mpd_df[mpd_task_col].astype(str).str.strip()
     mpd_lookup = mpd_df.set_index(mpd_task_col).to_dict(orient="index")
@@ -190,48 +166,32 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
     change_log = []
     flagged    = []
 
+    # ── Apply changes ─────────────────────────────────────────────────────────
     for entry in task_changes:
         task_id         = str(entry.get("task_id", "")).strip()
         changed_columns = entry.get("changed_columns", [])
-        soc_text        = str(entry.get("soc_text", "")).strip()
+        soc_remark      = entry.get("soc_remark", "")
 
-        if not task_id:
+        if not task_id or task_id not in aip_task_index:
+            if task_id: flagged.append({"Task ID": task_id, "Issue": "Not found in AIP"})
             continue
 
-        if task_id not in aip_task_index:
-            flagged.append({"Task ID": task_id, "Issue": "Not found in AIP"})
-            continue
+        aip_row = aip_task_index[task_id]
+        
+        # ── Write the Remark to the end column ────────────────────────────────
+        if soc_remark:
+            remark_cell = ws.cell(row=aip_row, column=audit_col_idx)
+            remark_cell.value = soc_remark
+            remark_cell.fill = YELLOW_FILL
 
         if task_id not in mpd_lookup:
             flagged.append({"Task ID": task_id, "Issue": "Not found in MPD"})
             continue
 
-        aip_row      = aip_task_index[task_id]
         mpd_row_data = mpd_lookup[task_id]
 
-        # Write SOC text
-        if soc_text:
-            old_soc = ws.cell(row=aip_row, column=soc_col_idx).value
-            safe_set_cell(ws, aip_row, soc_col_idx, soc_text)
-            ws.cell(row=aip_row, column=soc_col_idx).fill = YELLOW_FILL
-            ws.cell(row=aip_row, column=soc_col_idx).alignment = Alignment(wrap_text=True)
-
-            old_soc_str = str(old_soc).strip() if old_soc else ""
-            if old_soc_str != soc_text:
-                change_log.append({
-                    "Task ID": task_id,
-                    "Column": soc_text_col_name,
-                    "Old Value": old_soc_str,
-                    "New Value": soc_text
-                })
-
         for col_name in changed_columns:
-            if col_name not in aip_headers:
-                flagged.append({"Task ID": task_id, "Issue": f"Column '{col_name}' not in AIP"})
-                continue
-
-            if col_name not in mpd_row_data:
-                flagged.append({"Task ID": task_id, "Issue": f"Column '{col_name}' not in MPD"})
+            if col_name not in aip_headers or col_name not in mpd_row_data:
                 continue
 
             aip_col_idx = aip_headers[col_name]
@@ -243,30 +203,29 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
             if isinstance(new_value, float) and pd.isna(new_value):
                 new_value = None
 
-            old_str = str(old_value).strip() if old_value else ""
-            new_str = str(new_value).strip() if new_value else ""
+            old_str = str(old_value).strip() if old_value is not None else ""
+            new_str = str(new_value).strip() if new_value is not None else ""
+            
+            if old_str != new_str:
+                cell.value = new_value
+                cell.fill  = YELLOW_FILL
 
-            if old_str == new_str:
-                continue
+                change_log.append({
+                    "Task ID":   task_id,
+                    "Column":    col_name,
+                    "Old Value": old_str,
+                    "New Value": new_str,
+                })
 
-            cell.value = new_value
-            cell.fill  = YELLOW_FILL
-
-            change_log.append({
-                "Task ID": task_id,
-                "Column": col_name,
-                "Old Value": old_str,
-                "New Value": new_str
-            })
-
+    # ── Change Log sheet ──────────────────────────────────────────────────────
     if "Change Log" in wb.sheetnames:
         del wb["Change Log"]
 
-    log_ws = wb.create_sheet("Change Log")
-    headers = ["Task ID", "Column", "Old Value", "New Value"]
+    log_ws      = wb.create_sheet("Change Log")
+    log_headers = ["Task ID", "Column", "Old Value", "New Value"]
 
-    for c_idx, h in enumerate(headers, 1):
-        cell = log_ws.cell(row=1, column=c_idx, value=h)
+    for c_idx, h in enumerate(log_headers, 1):
+        cell      = log_ws.cell(row=1, column=c_idx, value=h)
         cell.fill = BLUE_FILL
         cell.font = WHITE_FONT
 
@@ -275,9 +234,5 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
         log_ws.cell(row=r_idx, column=2, value=entry["Column"])
         log_ws.cell(row=r_idx, column=3, value=entry["Old Value"])
         log_ws.cell(row=r_idx, column=4, value=entry["New Value"])
-
-    for col in log_ws.columns:
-        width = max((len(str(cell.value or "")) for cell in col), default=10) + 4
-        log_ws.column_dimensions[get_column_letter(col[0].column)].width = min(width, 60)
 
     return wb, change_log, flagged
