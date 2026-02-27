@@ -117,7 +117,7 @@ if st.button("▶  Run Update", type="primary", use_container_width=True, disabl
 
         # ── Step 4: Update AIP ───────────────────────────────────────────────
         status_text.text("✏️  Applying updates to AIP…")
-        updated_wb, change_log, flagged, stats = update_aip(
+        updated_wb, change_log, flagged = update_aip(
             aip_bytes, mpd_df, task_changes, task_id_col
         )
         progress_bar.progress(90)
