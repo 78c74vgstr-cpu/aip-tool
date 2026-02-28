@@ -213,7 +213,12 @@ def parse_soc_with_llm(soc_file_bytes, aip_columns: list, api_key: str,
     The api_key / checkpoint_state / progress_callback parameters are kept
     for backwards compatibility with existing app.py callers.
     """
-    soc_df         = pd.read_excel(soc_file_bytes)
+    # Auto-detect header row (SOC has title rows before the real headers)
+    raw            = pd.read_excel(soc_file_bytes, header=None, nrows=25)
+    header_idx     = int(raw.notna().sum(axis=1).idxmax())
+    soc_file_bytes.seek(0)
+
+    soc_df         = pd.read_excel(soc_file_bytes, header=header_idx)
     soc_df.columns = [str(c).strip() for c in soc_df.columns]
 
     # Detect columns
