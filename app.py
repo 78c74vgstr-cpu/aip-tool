@@ -28,7 +28,7 @@ with st.sidebar:
     )
     task_id_col = st.text_input(
         "Task ID Column Name",
-        value = "Task No",
+        value = "TASK NUMBER",
         help  = "The exact column header used for Task IDs in your AIP and MPD"
     )
 
