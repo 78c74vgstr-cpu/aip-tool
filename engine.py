@@ -96,65 +96,132 @@ def normalize(val):
 
 def _parse_soc_description(description: str):
     """
-    Parse all 'FIELD CHANGED FROM: X, TO: Y' patterns in a SOC description.
-    Returns two lists:
-      - column_updates: {amp_col: new_value}   — changes we apply automatically
-      - unmappable:     [{"field","old","new","is_mh"}]  — changes needing manual action
+    Parse ALL change patterns from a SOC description row.
+    Handles:
+      - FIELD CHANGED FROM: "X", TO: "Y"
+      - "X" ADDED / "Y" REMOVED
+      - IN FIELD: "X" ADDED AND "Y" REMOVED
+      - Combined multi-change lines
+
+    Returns:
+      - column_updates: {amp_col: new_value}         — applied automatically
+      - unmappable:     [{"field","old","new","is_mh"}] — written to SOC Note
     """
     column_updates = {}
     unmappable     = []
+    clean          = re.sub(r'\n+', '\n', str(description))
+    matched_lines  = set()
 
-    clean   = re.sub(r'\n+', '\n', str(description))
-    pattern = r'^([\w][^\n]{0,60}?)\s+CHANGED FROM:\s*"?(.*?)"?,?\s*TO:\s*"?(.*?)"?\s*$'
-
-    for m in re.finditer(pattern, clean, re.IGNORECASE | re.MULTILINE):
+    # ── Pattern 1: FIELD CHANGED FROM: "X", TO: "Y" ──────────────────────────
+    p1 = r'^([\w][^\n]{0,60}?)\s+CHANGED FROM:\s*"?(.*?)"?,?\s*TO:\s*"?(.*?)"?\s*$'
+    for m in re.finditer(p1, clean, re.IGNORECASE | re.MULTILINE):
+        matched_lines.add(m.group(0).strip())
         field   = m.group(1).strip().upper()
         old_val = m.group(2).strip().strip('"\'')
         new_val = m.group(3).strip().strip('"\'')
-
         if not new_val:
             continue
-
         if field in SOC_TO_AMP:
             column_updates[SOC_TO_AMP[field]] = new_val
-
-        elif any(kw in field for kw in MH_KEYWORDS):
-            unmappable.append({
-                "field": field,
-                "old":   old_val,
-                "new":   new_val,
-                "is_mh": True,
-            })
-
         else:
-            # Applicability, Task Note, TPS Marker, Skill, In Reference(s), etc.
+            is_mh = any(kw in field for kw in MH_KEYWORDS)
+            unmappable.append({"field": field, "old": old_val, "new": new_val, "is_mh": is_mh})
+
+    # ── Pattern 2: IN FIELD: "X" ADDED AND "Y" REMOVED (combined) ─────────────
+    p2 = r'^(IN\s+[\w][^\n]{0,50}?):\s+(.*?)\s+ADDED\s+AND\s+(.*?)\s+REMOVED\s*$'
+    for m in re.finditer(p2, clean, re.IGNORECASE | re.MULTILINE):
+        matched_lines.add(m.group(0).strip())
+        field   = m.group(1).strip().upper()
+        added   = m.group(2).strip().strip('"\'')
+        removed = m.group(3).strip().strip('"\'')
+        unmappable.append({
+            "field": field,
+            "old":   f"...{removed} (removed), {added} (added)",
+            "new":   f"see WAS/NOW",
+            "is_mh": any(kw in field for kw in MH_KEYWORDS),
+            "added":   added,
+            "removed": removed,
+        })
+
+    # ── Pattern 3: "X" ADDED / "Y" REMOVED standalone ────────────────────────
+    p3_added   = r'^([\w][^\n]{0,50}?)\s+"([^"]+)"\s+ADDED\s*$'
+    p3_removed = r'^([\w][^\n]{0,50}?)\s+"([^"]+)"\s+REMOVED\s*$'
+    for p3, action in [(p3_added, "ADDED"), (p3_removed, "REMOVED")]:
+        for m in re.finditer(p3, clean, re.IGNORECASE | re.MULTILINE):
+            matched_lines.add(m.group(0).strip())
+            field = m.group(1).strip().upper()
+            val   = m.group(2).strip()
             unmappable.append({
-                "field": field,
-                "old":   old_val,
-                "new":   new_val,
-                "is_mh": False,
+                "field":   field,
+                "old":     val if action == "REMOVED" else "",
+                "new":     val if action == "ADDED"   else "",
+                "is_mh":   any(kw in field for kw in MH_KEYWORDS),
+                "action":  action,
             })
+
+    # ── Pattern 4: TASK NOTE "..." ADDED/CHANGED ──────────────────────────────
+    p4 = r'^(TASK NOTE)\s+"([^"]+)"\s+(ADDED|CHANGED|REMOVED)\s*$'
+    for m in re.finditer(p4, clean, re.IGNORECASE | re.MULTILINE):
+        matched_lines.add(m.group(0).strip())
+        action = m.group(3).strip().upper()
+        unmappable.append({
+            "field":  "TASK NOTE",
+            "old":    m.group(2).strip() if action == "REMOVED" else "",
+            "new":    m.group(2).strip() if action != "REMOVED" else "",
+            "is_mh":  False,
+            "action": action,
+        })
+
+    # ── Catch-all: any line mentioning ADDED/REMOVED/CHANGED not yet matched ──
+    catchall = r'^(.+?(?:ADDED|REMOVED|CHANGED).+)$'
+    for m in re.finditer(catchall, clean, re.IGNORECASE | re.MULTILINE):
+        line = m.group(0).strip()
+        if line in matched_lines:
+            continue
+        if len(line) < 5:
+            continue
+        # Skip pure context lines (no change keywords at start)
+        if re.match(r'^(NOTE|SEE|REFER|IF |FOR |THE |THIS |A |AN )', line, re.IGNORECASE):
+            continue
+        unmappable.append({
+            "field":  "OTHER CHANGE",
+            "old":    "",
+            "new":    line,
+            "is_mh":  any(kw in line.upper() for kw in MH_KEYWORDS),
+            "raw":    True,
+        })
 
     return column_updates, unmappable
 
 
 def _format_soc_note(unmappable: list) -> str:
-    """
-    Turn unmappable change dicts into a human-readable cell value.
-    Each entry shows the exact old and new value so the operator
-    never needs to open the SOC document.
-    """
     lines = []
     for item in unmappable:
-        field = item["field"]
-        old   = item["old"]
-        new   = item["new"]
-        if item["is_mh"]:
+        field  = item.get("field", "")
+        old    = item.get("old", "").strip()
+        new    = item.get("new", "").strip()
+        is_mh  = item.get("is_mh", False)
+        action = item.get("action", "")
+        raw    = item.get("raw", False)
+
+        if raw:
+            lines.append(f"• {new}")
+        elif is_mh:
             lines.append(f"• {field}: {old} → {new}  (update in planning system)")
-        else:
+        elif action == "ADDED":
+            lines.append(f"• {field}: \"{new}\" ADDED")
+        elif action == "REMOVED":
+            lines.append(f"• {field}: \"{old}\" REMOVED")
+        elif "added" in item and "removed" in item:
+            lines.append(f"• {field}:")
+            lines.append(f"    ADDED:   {item['added']}")
+            lines.append(f"    REMOVED: {item['removed']}")
+        elif old and new:
             lines.append(f"• {field}:")
             lines.append(f"    WAS: {old}")
             lines.append(f"    NOW: {new}")
+        else:
+            lines.append(f"• {field}: {old or new}")
     return "\n".join(lines)
 
 
@@ -345,7 +412,14 @@ def update_aip(aip_file_bytes, mpd_df: pd.DataFrame,
             mpd_row_data = mpd_lookup[task_id]
             new_row      = ws.max_row + 1
 
+            # Write TASK NUMBER directly — it's the index key, not a column in mpd_row_data
+            if "TASK NUMBER" in aip_headers:
+                cell      = ws.cell(row=new_row, column=aip_headers["TASK NUMBER"], value=task_id)
+                cell.fill = GREEN_FILL
+
             for amp_col, mpd_col in AMP_TO_MPD.items():
+                if amp_col == "TASK NUMBER":
+                    continue  # already written above
                 if amp_col not in aip_headers:
                     continue
                 val = mpd_row_data.get(mpd_col, None)
